@@ -1,0 +1,70 @@
+# LibreCrawl technical SEO audit on Coolify (astropet).
+#
+# Builds the upstream images straight from GitHub at a pinned commit and adds a
+# Traefik router with basic auth in front of the MCP service. Mirrors upstream's
+# docker-compose.yml (https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp,
+# MIT) except for: git build contexts, no host port mapping, a named volume for
+# reports, and the `labels` block on `mcp`. See README.md.
+#
+# Upstream pin: ff2208db22b3584d8fda9a3d02fe09371bec4e9e (main, 2026-10-10)
+
+services:
+  librecrawl:
+    build:
+      context: "https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp.git#ff2208db22b3584d8fda9a3d02fe09371bec4e9e"
+      dockerfile: docker/librecrawl.Dockerfile
+    environment:
+      - LOCAL_MODE=true
+      - HOST_BINDING=0.0.0.0
+    volumes:
+      # Shared so the MCP can read LibreCrawl's SQLite for orphan/cleanup checks.
+      - librecrawl-data:/opt/librecrawl/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:5000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: "https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp.git#ff2208db22b3584d8fda9a3d02fe09371bec4e9e"
+      dockerfile: Dockerfile
+    depends_on:
+      librecrawl:
+        condition: service_healthy
+    environment:
+      - MCP_TRANSPORT=http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=5081
+      - LIBRECRAWL_URL=http://librecrawl:5000
+      - REPORTS_DIR=/reports
+      - LIBRECRAWL_UPSTREAM_DB=/librecrawl-data/users.db
+      - PAGESPEED_API_KEY=${PAGESPEED_API_KEY:-}
+    volumes:
+      - reports:/reports
+      - librecrawl-data:/librecrawl-data:ro
+    labels:
+      # Own router, priority above the one Coolify generates for the service domain,
+      # so every request to this host passes basic auth first.
+      - "traefik.enable=true"
+      - "traefik.http.routers.librecrawl-mcp.rule=Host(`librecrawl.astropet.de`)"
+      - "traefik.http.routers.librecrawl-mcp.entryPoints=https"
+      - "traefik.http.routers.librecrawl-mcp.tls=true"
+      - "traefik.http.routers.librecrawl-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.librecrawl-mcp.priority=1000"
+      - "traefik.http.routers.librecrawl-mcp.middlewares=librecrawl-auth,librecrawl-host"
+      - "traefik.http.routers.librecrawl-mcp.service=librecrawl-mcp"
+      - "traefik.http.services.librecrawl-mcp.loadbalancer.server.port=5081"
+      # htpasswd entry in {SHA} form: no `$`, so Compose interpolation and Coolify's
+      # label escaping leave it alone. Rotate per README.md.
+      - "traefik.http.middlewares.librecrawl-auth.basicauth.users=astropet:{SHA}/tEAiJyIMPSm9yla0N7s4y5G2S4="
+      # Upstream builds FastMCP without `host`, so the MCP SDK only accepts a localhost
+      # Host header (anything else -> 421). Present the request as local.
+      - "traefik.http.middlewares.librecrawl-host.headers.customRequestHeaders.Host=127.0.0.1:5081"
+    restart: unless-stopped
+
+volumes:
+  librecrawl-data:
+  reports:
